@@ -302,7 +302,7 @@ def _route_via_osrm(origin: LatLon,
         f"{origin.lon},{origin.lat};{destination.lon},{destination.lat}"
     )
     params = {
-        "overview": "full",
+        "overview": "simplified",
         "geometries": "polyline",
         "steps": "false",
     }
@@ -406,29 +406,56 @@ def find_stations_near_route(
     """
     Query the DB for all geocoded stations within `corridor_miles` of the route.
     Returns candidates sorted by position along the route.
+    Uses a spatial grid index for extreme performance (O(N+M) instead of O(N*M)).
     """
     from routes.models import FuelStation  # avoid circular import
+    from collections import defaultdict
 
     stations = FuelStation.objects.filter(
         latitude__isnull=False,
         longitude__isnull=False,
     ).values("opis_id", "name", "city", "state", "latitude", "longitude", "retail_price")
 
-    # Quick bounding-box pre-filter (1 degree ≈ 69 miles)
-    lats = [c[0] for c in coords]
-    lons = [c[1] for c in coords]
-    margin_deg = (corridor_miles + 10) / 69.0
-    lat_min, lat_max = min(lats) - margin_deg, max(lats) + margin_deg
-    lon_min, lon_max = min(lons) - margin_deg, max(lons) + margin_deg
+    # Build spatial grid index for route coordinates
+    # 0.1 degrees is roughly 7 miles
+    GRID_SIZE = 0.1
+    route_grid = defaultdict(list)
+    
+    # To further optimize, we can skip consecutive points that are extremely close
+    # But dictionary append is fast enough.
+    for i, (rlat, rlon) in enumerate(coords):
+        gx = int(rlon / GRID_SIZE)
+        gy = int(rlat / GRID_SIZE)
+        route_grid[(gx, gy)].append(i)
+
+    # 1 degree ≈ 69 miles, so check cells based on corridor size
+    search_radius = int((corridor_miles / 69.0) / GRID_SIZE) + 1
 
     candidates: List[StationCandidate] = []
     for s in stations:
         slat, slon = s["latitude"], s["longitude"]
-        if not (lat_min <= slat <= lat_max and lon_min <= slon <= lon_max):
+        
+        gx = int(slon / GRID_SIZE)
+        gy = int(slat / GRID_SIZE)
+        
+        nearby_indices = []
+        for dx in range(-search_radius, search_radius + 1):
+            for dy in range(-search_radius, search_radius + 1):
+                nearby_indices.extend(route_grid.get((gx + dx, gy + dy), []))
+                
+        if not nearby_indices:
             continue
+            
+        best_perp = float("inf")
+        best_along = 0.0
+        for i in nearby_indices:
+            rlat, rlon = coords[i]
+            d = haversine_miles(slat, slon, rlat, rlon)
+            if d < best_perp:
+                best_perp = d
+                best_along = cum_dist[i]
 
-        perp_dist, along_dist = nearest_point_distance(slat, slon, coords, cum_dist)
-        if perp_dist <= corridor_miles:
+        if best_perp <= corridor_miles:
             candidates.append(
                 StationCandidate(
                     opis_id=s["opis_id"],
@@ -438,7 +465,7 @@ def find_stations_near_route(
                     lat=slat,
                     lon=slon,
                     price=float(s["retail_price"]),
-                    distance_along_route=along_dist,
+                    distance_along_route=best_along,
                 )
             )
 

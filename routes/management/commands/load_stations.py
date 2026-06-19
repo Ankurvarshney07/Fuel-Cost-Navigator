@@ -75,8 +75,14 @@ class Command(BaseCommand):
         updated = 0
         geocoded = 0
         skipped = 0
+        
+        geocode_cache = {}
+        total_stations = len(stations_raw)
 
-        for opis_id, data in stations_raw.items():
+        for i, (opis_id, data) in enumerate(stations_raw.items(), 1):
+            if i % 100 == 0:
+                self.stdout.write(f"Processing station {i}/{total_stations}...")
+
             obj, was_created = FuelStation.objects.update_or_create(
                 opis_id=opis_id,
                 defaults={
@@ -95,7 +101,15 @@ class Command(BaseCommand):
             # Geocode if coordinates are missing (or --force)
             needs_geocode = force or (obj.latitude is None or obj.longitude is None)
             if needs_geocode:
-                coords = self._geocode(data["city"], data["state"])
+                city_state = (data["city"], data["state"])
+                
+                if city_state in geocode_cache:
+                    coords = geocode_cache[city_state]
+                else:
+                    coords = self._geocode(data["city"], data["state"])
+                    geocode_cache[city_state] = coords
+                    time.sleep(GEOCODE_DELAY)
+
                 if coords:
                     obj.latitude, obj.longitude = coords
                     obj.save(update_fields=["latitude", "longitude"])
@@ -105,7 +119,6 @@ class Command(BaseCommand):
                     self.stderr.write(
                         f"  ⚠ Could not geocode: {data['city']}, {data['state']}"
                     )
-                time.sleep(GEOCODE_DELAY)
 
         self.stdout.write(
             self.style.SUCCESS(
